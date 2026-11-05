@@ -76,6 +76,11 @@ def guess_services(q):
             found |= VOCAB[m[0]]
     return sorted(found)
 
+def service_text(name):
+    r = col.get(where={"service": name}, include=["documents"])
+    pairs = sorted(zip(r["ids"], r["documents"]), key=lambda p: int(p[0].rsplit("-", 1)[1]))
+    return "\n\n".join(d for _, d in pairs)
+
 class Turn(BaseModel):
     role: str
     content: str = Field(max_length=1000)
@@ -112,6 +117,12 @@ def log_unanswered(q):
     with open("unanswered.log", "a", encoding="utf-8") as f:
         f.write(q[:200].replace("\n", " ") + "\n")
 
+CJK = re.compile(r"[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]")
+
+
+def arabic_only(text):
+    m = CJK.search(text)
+    return text[:m.start()].rstrip() if m else text
 
 @app.post("/api/chat")
 async def chat(body: ChatIn, request: Request):
@@ -157,7 +168,7 @@ async def chat(body: ChatIn, request: Request):
             msgs += [{"role": t.role, "content": t.content} for t in history]
             msgs.append({
                 "role": "user",
-                "content": f"{note}المعلومات المرجعية:\n{context}\n\nسؤال المستخدم: {body.message}",
+                "content": f"{note}المعلومات المرجعية:\n{context}\n\nسؤال المستخدم: {body.message}\n\n(أجب بالعربية فقط.)",
             })
 
             r = await client.post(
@@ -170,7 +181,13 @@ async def chat(body: ChatIn, request: Request):
                 },
             )
             r.raise_for_status()
-            answer = r.json()["message"]["content"].strip()
+            answer = arabic_only(r.json()["message"]["content"].strip())
+            if len(answer) < 30:  # الجواب كله انكتب بلغة غريبة
+                log_unanswered(body.message)
+                return {
+                    "answer": "تعذّر تكوين جواب واضح، أعد صياغة سؤالك أو تواصل مع الدعم. " + CONTACT,
+                    "sources": [],
+                }
     except httpx.HTTPError as e:
         print("OLLAMA ERROR:", repr(e), flush=True)
         return JSONResponse({"answer": "الخدمة غير متاحة حاليًا. " + CONTACT}, status_code=503)
