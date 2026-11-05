@@ -1,3 +1,5 @@
-\db
-\venv
+venv/
+db/
+__pycache__/
+answers.txt
 unanswered.log

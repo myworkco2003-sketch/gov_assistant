@@ -8,6 +8,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+import difflib
+import re
 
 OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:7b-instruct")
@@ -37,6 +39,39 @@ app.add_middleware(
 
 col = chromadb.PersistentClient(path="db").get_collection("services")
 
+SRC_MARGIN = 0.08  # المصادر المعروضة: فقط القريبة من أفضل نتيجة
+
+TITLES = sorted({m["service"] for m in col.get(include=["metadatas"])["metadatas"]})
+SYSTEM_FULL = (
+    SYSTEM
+    + "\n\nقائمة الخدمات المتاحة:\n"
+    + "\n".join("- " + t for t in TITLES)
+    + "\nقد يخطئ المستخدم في كتابة اسم الخدمة أو يستخدم اسمًا غير رسمي: "
+    "طابقه مع أقرب خدمة في هذه القائمة، ولا تقل إن الخدمة غير موجودة "
+    "إلا إذا لم تشبه أي خدمة فيها."
+)
+
+
+def stem(w):
+    return w[2:] if w.startswith("ال") and len(w) > 5 else w
+
+
+VOCAB = {}
+for _t in TITLES:
+    for _w in re.findall(r"[\u0600-\u06FF]{4,}", _t):
+        VOCAB.setdefault(stem(_w), set()).add(_t)
+
+
+def guess_services(q):
+    found = set()
+    for w in re.findall(r"[\u0600-\u06FF]{4,}", q):
+        w = stem(w)
+        if w in VOCAB:
+            continue
+        m = difflib.get_close_matches(w, list(VOCAB), n=1, cutoff=0.8)
+        if m:
+            found |= VOCAB[m[0]]
+    return sorted(found)
 
 class Turn(BaseModel):
     role: str
@@ -83,15 +118,17 @@ async def chat(body: ChatIn, request: Request):
 
     history = [t for t in body.history if t.role in ("user", "assistant")][-4:]
     prev_user = [t.content for t in history if t.role == "user"][-1:]
+    guessed = guess_services(body.message)
+    query = body.message + (" " + " ".join(guessed) if guessed else "")
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            docs, metas, dists = await retrieve(client, body.message)
+            docs, metas, dists = await retrieve(client, query)
             # سؤال متابعة مثل "وكم الرسوم؟": نجرب مع السؤال السابق
             if (not dists or dists[0] > MAX_DISTANCE) and prev_user:
-                docs, metas, dists = await retrieve(client, prev_user[0] + " " + body.message)
+                docs, metas, dists = await retrieve(client, prev_user[0] + " " + query)
 
-            keep = [(d, m) for d, m, dist in zip(docs, metas, dists) if dist <= MAX_DISTANCE]
+            keep = [(d, m, dist) for d, m, dist in zip(docs, metas, dists) if dist <= MAX_DISTANCE]
             if not keep:
                 log_unanswered(body.message)
                 return {
@@ -99,12 +136,16 @@ async def chat(body: ChatIn, request: Request):
                     "sources": [],
                 }
 
-            context = "\n\n---\n\n".join(d for d, _ in keep)
-            msgs = [{"role": "system", "content": SYSTEM}]
+            context = "\n\n---\n\n".join(d for d, _, _ in keep)
+            note = ""
+            if guessed:
+                note = ("ملاحظة: يبدو أن المستخدم يقصد: " + "، ".join(guessed)
+                        + " (كتب الاسم بشكل غير دقيق).\n\n")
+            msgs = [{"role": "system", "content": SYSTEM_FULL}]
             msgs += [{"role": t.role, "content": t.content} for t in history]
             msgs.append({
                 "role": "user",
-                "content": f"المعلومات المرجعية:\n{context}\n\nسؤال المستخدم: {body.message}",
+                "content": f"{note}المعلومات المرجعية:\n{context}\n\nسؤال المستخدم: {body.message}",
             })
 
             r = await client.post(
@@ -121,8 +162,11 @@ async def chat(body: ChatIn, request: Request):
     except httpx.HTTPError:
         return JSONResponse({"answer": "الخدمة غير متاحة حاليًا. " + CONTACT}, status_code=503)
 
+    best = min(dist for _, _, dist in keep)
     seen, sources = set(), []
-    for _, m in keep:
+    for _, m, dist in keep:
+        if dist > best + SRC_MARGIN:
+            continue
         key = (m["service"], m["updated"])
         if key not in seen:
             seen.add(key)
